@@ -1,13 +1,21 @@
 """
 Wordle Word Checker - SMS & WhatsApp Service
 =============================================
-HARDCORE MODE: Pure regex matching + probability-based suggestions
+HARDCORE MODE: Pure regex + probability-based suggestions
 
-Uppercase = GREEN (locked in that position)
-Suggestions maximize your odds by testing the most common letters
-among remaining candidates.
+INPUT FORMAT:
+  - UPPERCASE = 🟩 GREEN (locked in that position)
+  - space before letter = 🟨 YELLOW (in word, wrong spot)
+  - lowercase = ⬜ GREY (not in word)
 
-No heuristics, no guessing — just regex and frequency analysis.
+EXAMPLES:
+  st aRe → s,t,e grey | a yellow | R green
+  cr aNE → c,r grey | a yellow | N,E green
+  
+MORE RESULTS:
+  stARe+  → 6 suggestions
+  stARe++ → 9 suggestions
+  +       → 3 more from last search
 """
 
 import os
@@ -29,6 +37,7 @@ WORDLIST_PATH = os.path.join(os.path.dirname(__file__), "wordlist.txt")
 # --- In-memory cache ---
 _past_answers_cache = {"words": set(), "last_fetched": 0}
 _wordlist_cache = {"words": set(), "loaded": False}
+_user_sessions = {}  # {phone: {"last_query": ..., "last_offset": ..., "last_results": ...}}
 CACHE_TTL = 3600
 
 
@@ -96,62 +105,148 @@ def get_past_answers() -> set:
 
 
 # ============================================
+# PATTERN PARSER
+# ============================================
+
+def parse_input(raw_input: str) -> dict:
+    """
+    Parse input with:
+    - UPPERCASE = green (locked in position)
+    - space before letter = yellow (in word, not this position)
+    - lowercase = grey (not in word)
+    
+    Also handles + suffix for more results.
+    
+    Returns: {
+        "word": the 5-letter word (uppercase),
+        "green": {pos: letter},     # locked positions
+        "yellow": {pos: letter},    # must be in word, not here
+        "grey": set of letters,     # exclude these
+        "extra_count": 0/3/6        # from + or ++
+    }
+    """
+    # Check for + suffix
+    extra_count = 0
+    clean_input = raw_input.rstrip('+')
+    plus_count = len(raw_input) - len(clean_input)
+    extra_count = plus_count * 3
+    
+    # Parse the pattern
+    green = {}
+    yellow = {}
+    grey = set()
+    word_chars = []
+    
+    pos = 0
+    i = 0
+    prev_space = False
+    
+    while i < len(clean_input):
+        ch = clean_input[i]
+        
+        if ch == ' ':
+            prev_space = True
+            i += 1
+            continue
+        
+        if ch.isalpha():
+            letter = ch.upper()
+            word_chars.append(letter)
+            
+            if ch.isupper():
+                # GREEN - locked
+                green[pos] = letter
+            elif prev_space:
+                # YELLOW - in word, not here
+                yellow[pos] = letter
+            else:
+                # GREY - not in word
+                grey.add(letter)
+            
+            pos += 1
+            prev_space = False
+        
+        i += 1
+    
+    word = "".join(word_chars)
+    
+    # Remove yellow letters from grey (they're in the word!)
+    yellow_letters = set(yellow.values())
+    grey = grey - yellow_letters
+    
+    # Remove green letters from grey
+    green_letters = set(green.values())
+    grey = grey - green_letters
+    
+    return {
+        "word": word,
+        "green": green,
+        "yellow": yellow,
+        "grey": grey,
+        "extra_count": extra_count
+    }
+
+
+# ============================================
 # HARDCORE REGEX + PROBABILITY ENGINE
 # ============================================
 
-def parse_pattern(raw_word: str) -> tuple:
+def filter_candidates(parsed: dict) -> list:
     """
-    Parse input into regex pattern and metadata.
-    
-    Uppercase = GREEN (locked in position)
-    Lowercase = tested but not locked (grey or yellow)
-    
-    Returns: (word_upper, regex_pattern, locked_positions, tested_letters)
-    
-    Example: "crANe" 
-    → ("CRANE", "..AN.", {2: 'A', 3: 'N'}, {'C', 'R', 'E'})
+    Filter words using regex and letter rules.
     """
-    word_upper = raw_word.upper()
-    locked = {}
-    tested = set()
+    wordlist = load_wordlist()
+    past = get_past_answers()
+    available = wordlist - past
+    
+    green = parsed["green"]
+    yellow = parsed["yellow"]
+    grey = parsed["grey"]
+    
+    # Build regex pattern for green letters
     pattern_chars = []
-    
-    for i, ch in enumerate(raw_word):
-        if ch.isupper():
-            # GREEN - locked in this position
-            locked[i] = ch.upper()
-            pattern_chars.append(ch.upper())
+    for i in range(5):
+        if i in green:
+            pattern_chars.append(green[i])
         else:
-            # Tested but not green
-            tested.add(ch.upper())
             pattern_chars.append(".")
     
     regex_pattern = "".join(pattern_chars)
-    return word_upper, regex_pattern, locked, tested
-
-
-def filter_candidates(regex_pattern: str, exclude_used: bool = True) -> list:
-    """
-    Get all words matching the regex pattern.
-    Excludes past Wordle answers by default.
-    """
-    wordlist = load_wordlist()
-    past = get_past_answers() if exclude_used else set()
-    
-    available = wordlist - past
-    
     pattern = re.compile(f"^{regex_pattern}$")
-    matches = [w for w in available if pattern.match(w)]
+    
+    # Filter candidates
+    matches = []
+    yellow_letters = set(yellow.values())
+    yellow_positions = yellow  # {pos: letter} - letter must NOT be in this pos
+    
+    for word in available:
+        # Must match green pattern
+        if not pattern.match(word):
+            continue
+        
+        # Must not contain grey letters
+        if any(letter in word for letter in grey):
+            continue
+        
+        # Must contain all yellow letters
+        if not all(letter in word for letter in yellow_letters):
+            continue
+        
+        # Yellow letters must NOT be in their original positions
+        valid = True
+        for pos, letter in yellow_positions.items():
+            if pos < len(word) and word[pos] == letter:
+                valid = False
+                break
+        
+        if valid:
+            matches.append(word)
     
     return sorted(matches)
 
 
 def analyze_position_frequencies(candidates: list, locked_positions: dict) -> dict:
-    """
-    For each unlocked position, count letter frequencies among candidates.
-    
-    Returns: {position: Counter({letter: count, ...}), ...}
-    """
+    """Count letter frequencies at each unlocked position."""
     position_freq = {i: Counter() for i in range(5) if i not in locked_positions}
     
     for word in candidates:
@@ -162,102 +257,160 @@ def analyze_position_frequencies(candidates: list, locked_positions: dict) -> di
 
 
 def score_suggestion(word: str, position_freq: dict, tested_letters: set, locked_positions: dict) -> float:
-    """
-    Score a word based on how well it tests high-probability letters.
-    
-    Higher score = tests more common letters in positions that need testing.
-    """
+    """Score based on testing high-frequency letters."""
     score = 0.0
     seen = set()
     
     for i, ch in enumerate(word):
-        # Skip locked positions - we already know those
         if i in locked_positions:
             continue
         
-        # Penalize repeat letters within the word
         if ch in seen:
             score -= 5.0
         seen.add(ch)
         
-        # Skip letters we've already tested
         if ch in tested_letters:
             continue
         
-        # Score based on frequency of this letter in this position
         if i in position_freq and ch in position_freq[i]:
-            # Normalize: what % of candidates have this letter here?
             total = sum(position_freq[i].values())
             if total > 0:
                 freq_pct = position_freq[i][ch] / total
-                score += freq_pct * 10.0  # Weight it
+                score += freq_pct * 10.0
     
     return score
 
 
-def find_best_suggestions(raw_word: str, max_suggestions: int = 3) -> dict:
+def find_best_suggestions(parsed: dict, count: int = 3, offset: int = 0) -> dict:
     """
-    MAIN ENGINE: Find optimal next guesses.
+    Find optimal next guesses.
     
-    Returns dict with:
-    - pattern: the regex pattern used
-    - candidates_count: how many words match
-    - suggestions: list of best words to try
-    - locked_display: visual of locked positions
+    Returns dict with pattern info and ranked suggestions.
     """
-    word_upper, regex_pattern, locked, tested = parse_pattern(raw_word)
+    candidates = filter_candidates(parsed)
     
-    # Get all matching candidates
-    candidates = filter_candidates(regex_pattern)
+    green = parsed["green"]
+    yellow = parsed["yellow"]
+    grey = parsed["grey"]
+    
+    # Build display pattern
+    display = []
+    for i in range(5):
+        if i in green:
+            display.append(f"[{green[i]}]")  # Green
+        elif i in yellow:
+            display.append(f"({yellow[i]})")  # Yellow
+        else:
+            display.append("_")
+    pattern_display = "".join(display)
     
     if not candidates:
         return {
-            "pattern": regex_pattern,
+            "pattern_display": pattern_display,
             "candidates_count": 0,
             "suggestions": [],
-            "locked_display": None,
-            "sample_candidates": []
+            "has_more": False
         }
     
-    # Build locked position display
-    locked_display = ["_"] * 5
-    for pos, letter in locked.items():
-        locked_display[pos] = letter
-    locked_str = " ".join(locked_display)
-    
-    # If only a few candidates, just return them
-    if len(candidates) <= max_suggestions:
+    # If few candidates, just return them
+    if len(candidates) <= count + offset:
         return {
-            "pattern": regex_pattern,
+            "pattern_display": pattern_display,
             "candidates_count": len(candidates),
-            "suggestions": candidates,
-            "locked_display": locked_str,
-            "sample_candidates": candidates[:5]
+            "suggestions": candidates[offset:offset+count],
+            "has_more": False
         }
     
-    # Analyze letter frequencies in each position
-    position_freq = analyze_position_frequencies(candidates, locked)
+    # Score candidates by probability value
+    position_freq = analyze_position_frequencies(candidates, green)
+    tested = grey | set(yellow.values()) | set(green.values())
     
-    # Score all candidates
     scored = []
     for candidate in candidates:
-        if candidate == word_upper:
-            continue
-        s = score_suggestion(candidate, position_freq, tested, locked)
+        s = score_suggestion(candidate, position_freq, tested, green)
         scored.append((candidate, s))
     
-    # Sort by score descending
     scored.sort(key=lambda x: -x[1])
     
-    suggestions = [w for w, s in scored[:max_suggestions]]
+    suggestions = [w for w, s in scored[offset:offset+count]]
+    has_more = len(scored) > offset + count
     
     return {
-        "pattern": regex_pattern,
+        "pattern_display": pattern_display,
         "candidates_count": len(candidates),
         "suggestions": suggestions,
-        "locked_display": locked_str,
-        "sample_candidates": candidates[:5]
+        "has_more": has_more,
+        "all_scored": scored  # For session storage
     }
+
+
+# ============================================
+# BEST STARTER WORD
+# ============================================
+
+def get_recent_answers(n: int = 20) -> list:
+    """Get the N most recent Wordle answers."""
+    db = load_local_db()
+    if not db:
+        return []
+    
+    # Sort by date descending
+    sorted_words = sorted(db.items(), key=lambda x: x[1].get("date", ""), reverse=True)
+    return [word for word, _ in sorted_words[:n]]
+
+
+def get_best_starter() -> dict:
+    """
+    Find the best starting word:
+    - 5 unique letters
+    - High frequency letters in remaining candidates
+    - Dissimilar to recent answers (avoid their letters)
+    """
+    wordlist = load_wordlist()
+    past = get_past_answers()
+    available = wordlist - past
+    
+    if not available:
+        return {"word": "SALET", "letters": "S, A, L, E, T"}
+    
+    # Get recent answers to avoid their patterns
+    recent = get_recent_answers(20)
+    recent_letters = Counter()
+    for word in recent:
+        for ch in word:
+            recent_letters[ch] += 1
+    
+    # Count letter frequency in available words
+    letter_freq = Counter()
+    for word in available:
+        for ch in set(word):  # Count each letter once per word
+            letter_freq[ch] += 1
+    
+    # Score each available word
+    best_word = None
+    best_score = -1
+    
+    for word in available:
+        # Must have 5 unique letters
+        if len(set(word)) != 5:
+            continue
+        
+        score = 0
+        for ch in word:
+            # Add frequency score
+            score += letter_freq.get(ch, 0)
+            # Penalize letters from recent answers
+            score -= recent_letters.get(ch, 0) * 2
+        
+        if score > best_score:
+            best_score = score
+            best_word = word
+    
+    if not best_word:
+        best_word = "SALET"
+    
+    letters = ", ".join(best_word)
+    return {"word": best_word, "letters": letters}
 
 
 # ============================================
@@ -311,7 +464,7 @@ def check_wordle_word(word: str) -> dict:
     if len(word_upper) != 5 or not word_upper.isalpha():
         return {
             "error": True,
-            "message": f"'{word_upper}' isn't a valid 5-letter word.\nSend any 5-letter word to check!"
+            "message": f"'{word_upper}' isn't a valid 5-letter word."
         }
 
     result = check_via_api(word_upper)
@@ -325,50 +478,37 @@ def check_wordle_word(word: str) -> dict:
     return {"error": True, "message": "Service temporarily unavailable. Try again shortly! 🔧"}
 
 
-def format_response(result: dict, raw_word: str) -> str:
-    """Format response with probability-based suggestions."""
+def format_response(result: dict, parsed: dict, analysis: dict) -> str:
+    """Format response with suggestions."""
     if result.get("error"):
         return f"⚠️ {result['message']}"
 
+    msg_parts = []
+    
     if result["found"]:
-        msg = (
-            f"✅ YES! *{result['word']}* was Wordle #{result['game']}\n"
-            f"📅 Date: {result['date']}\n"
-            f"😅 Difficulty: {result['difficulty']}/10"
+        msg_parts.append(
+            f"✅ *{result['word']}* was Wordle #{result['game']}\n"
+            f"📅 {result['date']} | Difficulty: {result['difficulty']}/10"
         )
-        
-        # Get probability-based suggestions
-        analysis = find_best_suggestions(raw_word)
+    else:
+        msg_parts.append(
+            f"❌ *{result['word']}* hasn't been used yet.\n"
+            f"Could be a future puzzle! 🤞"
+        )
+    
+    # Add analysis
+    if analysis["candidates_count"] > 0:
+        msg_parts.append(f"\n🎯 Pattern: {analysis['pattern_display']}")
+        msg_parts.append(f"📊 {analysis['candidates_count']} possible words")
         
         if analysis["suggestions"]:
             formatted = ", ".join(f"*{s}*" for s in analysis["suggestions"])
-            
-            if analysis["locked_display"] and "_" in analysis["locked_display"]:
-                msg += f"\n\n🎯 Pattern: [{analysis['locked_display']}]"
-                msg += f"\n📊 {analysis['candidates_count']} possible words"
-                msg += f"\n💡 Best bets: {formatted}"
-            else:
-                msg += f"\n\n💡 Try instead: {formatted}"
+            msg_parts.append(f"💡 Best: {formatted}")
         
-        return msg
-    else:
-        # Word not used - also give suggestions for this pattern
-        analysis = find_best_suggestions(raw_word)
-        
-        msg = (
-            f"❌ Nope! *{result['word']}* has NOT been a Wordle answer yet.\n"
-            f"It could be a future puzzle! 🤞"
-        )
-        
-        if analysis["locked_display"] and "_" in analysis["locked_display"]:
-            if analysis["candidates_count"] > 0:
-                msg += f"\n\n🎯 Pattern: [{analysis['locked_display']}]"
-                msg += f"\n📊 {analysis['candidates_count']} words match"
-                if analysis["suggestions"]:
-                    formatted = ", ".join(f"*{s}*" for s in analysis["suggestions"])
-                    msg += f"\n💡 High-prob: {formatted}"
-        
-        return msg
+        if analysis["has_more"]:
+            msg_parts.append("📌 Send *+* for more")
+    
+    return "\n".join(msg_parts)
 
 
 # ============================================
@@ -379,30 +519,94 @@ def format_response(result: dict, raw_word: str) -> str:
 def sms_reply():
     """Handle incoming SMS/WhatsApp."""
     incoming_msg = request.values.get("Body", "").strip()
+    from_number = request.values.get("From", "unknown")
+    
     resp = MessagingResponse()
     msg = resp.message()
 
-    if incoming_msg.lower() in ("help", "hi", "hello", "hey", "start", "?", "menu"):
+    # Help
+    if incoming_msg.lower() in ("help", "hi", "hello", "hey", "start", "menu"):
         msg.body(
-            "🟩🟨⬜ *Wordle Word Checker* ⬜🟨🟩\n\n"
-            "Text any 5-letter word to check if it's been used.\n\n"
-            "🎯 *UPPERCASE = GREEN letters!*\n"
-            "I'll find words matching that pattern\n"
-            "and suggest highest-probability picks.\n\n"
-            "Example: *stARe* → locks A in pos 3, R in pos 4\n"
-            "Shows how many words match + best guesses.\n\n"
-            "Pure regex + probability. No guessing. 📊"
+            "🟩🟨⬜ *Wordle Solver* ⬜🟨🟩\n\n"
+            "Send your guess with colors:\n"
+            "• *UPPERCASE* = 🟩 green\n"
+            "• *space before* = 🟨 yellow\n"
+            "• *lowercase* = ⬜ grey\n\n"
+            "Example: *st aRe*\n"
+            "→ s,t,e grey | a yellow | R green\n\n"
+            "*?* = best starting word\n"
+            "*+* = more results\n"
+            "*stARe++* = lots more\n\n"
+            "Pure math. No guessing. 📊"
         )
         return str(resp)
-
-    result = check_wordle_word(incoming_msg)
-    msg.body(format_response(result, incoming_msg))
+    
+    # Handle "?" for best starting word
+    if incoming_msg.strip() == "?":
+        suggestion = get_best_starter()
+        msg.body(
+            f"🎯 *Best opener: {suggestion['word']}*\n\n"
+            f"📊 Tests top letters: {suggestion['letters']}\n"
+            f"🔀 Avoids recent patterns\n\n"
+            f"Send it, then tell me what you got!"
+        )
+        return str(resp)
+    
+    # Handle "+" for more results
+    if incoming_msg.strip('+') == '':
+        plus_count = len(incoming_msg)
+        extra = plus_count * 3
+        
+        session = _user_sessions.get(from_number)
+        if session and "all_scored" in session:
+            offset = session.get("offset", 3)
+            scored = session["all_scored"]
+            
+            suggestions = [w for w, s in scored[offset:offset+extra]]
+            has_more = len(scored) > offset + extra
+            
+            if suggestions:
+                _user_sessions[from_number]["offset"] = offset + extra
+                formatted = ", ".join(f"*{s}*" for s in suggestions)
+                reply = f"💡 More: {formatted}"
+                if has_more:
+                    reply += "\n📌 Send *+* for more"
+                msg.body(reply)
+            else:
+                msg.body("No more suggestions for that pattern.")
+        else:
+            msg.body("No previous search. Send a word first!")
+        return str(resp)
+    
+    # Parse input
+    parsed = parse_input(incoming_msg)
+    
+    if len(parsed["word"]) != 5:
+        msg.body("⚠️ Need exactly 5 letters.\nExample: st aRe")
+        return str(resp)
+    
+    # Check if word was used
+    result = check_wordle_word(parsed["word"])
+    
+    # Get suggestions
+    base_count = 3 + parsed["extra_count"]
+    analysis = find_best_suggestions(parsed, count=base_count)
+    
+    # Store session for "+" follow-up
+    _user_sessions[from_number] = {
+        "parsed": parsed,
+        "offset": base_count,
+        "all_scored": analysis.get("all_scored", [])
+    }
+    
+    # Format and send
+    msg.body(format_response(result, parsed, analysis))
     return str(resp)
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return "🟩 Wordle Checker is running! (Hardcore Mode)", 200
+    return "🟩 Wordle Solver (Hardcore Mode) is running!", 200
 
 
 if __name__ == "__main__":
