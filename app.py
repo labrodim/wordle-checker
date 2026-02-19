@@ -327,13 +327,13 @@ def get_recent_answers(n: int = 20) -> list:
 
 
 def get_best_starter() -> dict:
-    """Find best starting word - high freq letters, dissimilar to recent."""
+    """Find best starting words - high freq letters, dissimilar to recent."""
     wordlist = load_wordlist()
     past = get_past_answers()
     available = wordlist - past
     
     if not available:
-        return {"word": "SLATE", "letters": "S, L, A, T, E"}
+        return {"word": "SLATE", "letters": "S, L, A, T, E", "all": ["SLATE"]}
     
     recent = get_recent_answers(20)
     recent_letters = Counter()
@@ -346,9 +346,8 @@ def get_best_starter() -> dict:
         for ch in set(word):
             letter_freq[ch] += 1
     
-    best_word = None
-    best_score = -1
-    
+    # Score ALL words with 5 unique letters
+    scored = []
     for word in available:
         if len(set(word)) != 5:
             continue
@@ -358,14 +357,16 @@ def get_best_starter() -> dict:
             score += letter_freq.get(ch, 0)
             score -= recent_letters.get(ch, 0) * 2
         
-        if score > best_score:
-            best_score = score
-            best_word = word
+        scored.append((word, score))
     
-    if not best_word:
-        best_word = "SLATE"
+    scored.sort(key=lambda x: -x[1])
+    all_starters = [w for w, s in scored]
     
-    return {"word": best_word, "letters": ", ".join(best_word)}
+    if not all_starters:
+        return {"word": "SLATE", "letters": "S, L, A, T, E", "all": ["SLATE"]}
+    
+    best = all_starters[0]
+    return {"word": best, "letters": ", ".join(best), "all": all_starters}
 
 
 # ============================================
@@ -467,12 +468,20 @@ def sms_reply():
     # Best starter
     if incoming_msg.strip() == "?":
         starter = get_best_starter()
-        msg.body(
-            f"🎯 *Best opener: {starter['word']}*\n\n"
-            f"📊 Letters: {starter['letters']}\n"
-            f"🔀 Avoids recent patterns\n\n"
-            f"Send it, then tell me the result!"
-        )
+        
+        # Store all starters for + follow-up
+        _user_sessions[from_number] = {
+            "suggestions": starter["all"],
+            "index": 1,
+            "mode": "starter"
+        }
+        
+        remaining = len(starter["all"]) - 1
+        reply = f"🎯 *Best opener: {starter['word']}*\n📊 Letters: {starter['letters']}"
+        if remaining > 0:
+            reply += f"\n📌 Send *+* for more options"
+        
+        msg.body(reply)
         return str(resp)
     
     # More results (+, ++, +++)
