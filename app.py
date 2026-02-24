@@ -864,18 +864,21 @@ def sms_reply():
     if incoming_msg.strip() == "*":
         if from_number in _user_sessions:
             del _user_sessions[from_number]
-        msg.body("🔄 Reset! Send a word or *?* for best starter.")
+        msg.body("🔄 Reset! All constraints cleared.\nSend *?* for best starter.")
         return str(resp)
     
     # Best starter
     if incoming_msg.strip() == "?":
         starter = get_best_starter()
         
-        # Store all starters for + follow-up
+        # Store all starters for + follow-up (this resets accumulated constraints)
         _user_sessions[from_number] = {
             "suggestions": starter["all"],
             "index": 1,
-            "mode": "starter"
+            "mode": "starter",
+            "accumulated_grey": set(),
+            "accumulated_yellow": {},
+            "accumulated_green": {}
         }
         
         remaining = len(starter["all"]) - 1
@@ -925,20 +928,56 @@ def sms_reply():
         msg.body("⚠️ Need exactly 5 letters.\nExample: st(a)Re")
         return str(resp)
     
+    # ACCUMULATE constraints from previous guesses in this session
+    session = _user_sessions.get(from_number, {})
+    accumulated_grey = session.get("accumulated_grey", set())
+    accumulated_yellow = session.get("accumulated_yellow", {})
+    accumulated_green = session.get("accumulated_green", {})
+    
+    # Merge new constraints with accumulated
+    # Green overwrites everything for that position
+    for pos, letter in parsed["green"].items():
+        accumulated_green[pos] = letter
+        # Remove from yellow if it was there
+        if pos in accumulated_yellow:
+            del accumulated_yellow[pos]
+    
+    # Yellow adds to accumulated (unless position now green)
+    for pos, letter in parsed["yellow"].items():
+        if pos not in accumulated_green:
+            accumulated_yellow[pos] = letter
+    
+    # Grey accumulates
+    accumulated_grey.update(parsed["grey"])
+    # But remove any letters that are now known to be in the word
+    accumulated_grey = accumulated_grey - set(accumulated_green.values()) - set(accumulated_yellow.values())
+    
+    # Build merged parsed dict for the engine
+    merged_parsed = {
+        "word": parsed["word"],
+        "green": accumulated_green.copy(),
+        "yellow": accumulated_yellow.copy(),
+        "grey": accumulated_grey.copy(),
+        "extra_count": parsed["extra_count"]
+    }
+    
     # Check if word was used
     result = check_wordle_word(parsed["word"])
     
-    # Get ALL suggestions
-    all_suggestions = find_best_suggestions(parsed)
+    # Get ALL suggestions using ACCUMULATED constraints
+    all_suggestions = find_best_suggestions(merged_parsed)
     
     # How many to show
     show_count = 3 + parsed["extra_count"]
     
-    # Store session
+    # Store session WITH accumulated constraints
     _user_sessions[from_number] = {
         "suggestions": all_suggestions,
         "index": show_count,
-        "parsed": parsed
+        "parsed": merged_parsed,
+        "accumulated_grey": accumulated_grey,
+        "accumulated_yellow": accumulated_yellow,
+        "accumulated_green": accumulated_green
     }
     
     # Build response
@@ -951,11 +990,17 @@ def sms_reply():
     else:
         msg_parts.append(f"❌ *{result['word']}* not used yet")
     
-    pattern_display = build_pattern_display(parsed)
+    pattern_display = build_pattern_display(merged_parsed)
     candidate_count = len(all_suggestions)
     
     if candidate_count > 0:
         msg_parts.append(f"\n🎯 {pattern_display}")
+        
+        # Show excluded letters if any accumulated
+        if accumulated_grey:
+            excluded = "".join(sorted(accumulated_grey))
+            msg_parts.append(f"🚫 Excluded: {excluded}")
+        
         msg_parts.append(f"📊 {candidate_count} possible")
         
         top = all_suggestions[:show_count]
