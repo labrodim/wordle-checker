@@ -592,7 +592,7 @@ def find_best_suggestions(parsed: dict) -> list:
 
 
 def build_pattern_display(parsed: dict) -> str:
-    """Build visual pattern like [S]_(A)__"""
+    """Build visual pattern like [S]_[R][E]_ with yellow letters listed separately."""
     green = parsed["green"]
     yellow = parsed["yellow"]
     
@@ -600,12 +600,18 @@ def build_pattern_display(parsed: dict) -> str:
     for i in range(5):
         if i in green:
             display.append(f"[{green[i]}]")
-        elif i in yellow:
-            display.append(f"({yellow[i]})")
         else:
             display.append("_")
     
-    return "".join(display)
+    pattern = "".join(display)
+    
+    # Add yellow letters separately (unique, exclude any that are now green)
+    green_letters = set(green.values())
+    yellow_letters = set(yellow.values()) - green_letters
+    if yellow_letters:
+        pattern += f" +{','.join(sorted(yellow_letters))}"
+    
+    return pattern
 
 
 # ============================================
