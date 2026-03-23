@@ -318,10 +318,10 @@ def process_wordle_screenshot(image, word):
     if not colors or len(colors) != 5:
         return None
     
-    # Build parsed dict
+    # Build parsed dict - track grey positions for max_count logic
     green = {}
     yellow = {}
-    grey = set()
+    grey_positions = []  # (letter, position) for grey
     
     for i, (letter, color) in enumerate(zip(word, colors)):
         if color == "green":
@@ -329,16 +329,35 @@ def process_wordle_screenshot(image, word):
         elif color == "yellow":
             yellow[i] = letter
         else:  # grey
-            grey.add(letter)
+            grey_positions.append((letter, i))
     
-    # Clean up grey
-    grey = grey - set(yellow.values()) - set(green.values())
+    # Count how many times each letter appears as green or yellow
+    from collections import Counter
+    confirmed_counts = Counter()
+    for letter in green.values():
+        confirmed_counts[letter] += 1
+    for letter in yellow.values():
+        confirmed_counts[letter] += 1
+    
+    # Determine grey letters and max_counts
+    grey = set()
+    max_counts = {}
+    
+    for letter, pos in grey_positions:
+        if letter in confirmed_counts:
+            # Letter appears both grey AND green/yellow
+            # This means: word has EXACTLY confirmed_counts[letter] of this letter
+            max_counts[letter] = confirmed_counts[letter]
+        else:
+            # Pure grey - letter not in word at all
+            grey.add(letter)
     
     return {
         "word": word,
         "green": green,
         "yellow": yellow,
         "grey": grey,
+        "max_counts": max_counts,
         "extra_count": 0
     }
 
@@ -417,8 +436,13 @@ def parse_input(raw_input: str) -> dict:
         "green": {pos: letter},
         "yellow": {pos: letter},
         "grey": set of letters,
+        "max_counts": {letter: max_count} - letters with upper bound on occurrences,
         "extra_count": from + suffix
     }
+    
+    IMPORTANT: When a letter appears both as green/yellow AND grey in the same guess,
+    it means the word has EXACTLY that many of that letter (no more).
+    Example: (r)E(s)et means E appears exactly once (green at pos 2, grey at pos 4).
     """
     # Check for + suffix
     clean_input = raw_input.rstrip('+')
@@ -427,7 +451,7 @@ def parse_input(raw_input: str) -> dict:
     
     green = {}
     yellow = {}
-    grey = set()
+    grey_positions = []  # Track (letter, position) for grey
     word_chars = []
     
     pos = 0
@@ -453,8 +477,8 @@ def parse_input(raw_input: str) -> dict:
                 # GREEN - locked
                 green[pos] = letter
             else:
-                # GREY - not in word
-                grey.add(letter)
+                # GREY - not in word (or no MORE of this letter)
+                grey_positions.append((letter, pos))
             
             pos += 1
         
@@ -462,16 +486,33 @@ def parse_input(raw_input: str) -> dict:
     
     word = "".join(word_chars)
     
-    # Remove yellow/green letters from grey
-    yellow_letters = set(yellow.values())
-    green_letters = set(green.values())
-    grey = grey - yellow_letters - green_letters
+    # Count how many times each letter appears as green or yellow
+    from collections import Counter
+    confirmed_counts = Counter()
+    for letter in green.values():
+        confirmed_counts[letter] += 1
+    for letter in yellow.values():
+        confirmed_counts[letter] += 1
+    
+    # Determine grey letters and max_counts
+    grey = set()
+    max_counts = {}  # Letters with an upper bound on their count
+    
+    for letter, pos in grey_positions:
+        if letter in confirmed_counts:
+            # Letter appears both grey AND green/yellow
+            # This means: word has EXACTLY confirmed_counts[letter] of this letter
+            max_counts[letter] = confirmed_counts[letter]
+        else:
+            # Pure grey - letter not in word at all
+            grey.add(letter)
     
     return {
         "word": word,
         "green": green,
         "yellow": yellow,
         "grey": grey,
+        "max_counts": max_counts,
         "extra_count": extra_count
     }
 
@@ -489,6 +530,7 @@ def filter_candidates(parsed: dict) -> list:
     green = parsed["green"]
     yellow = parsed["yellow"]
     grey = parsed["grey"]
+    max_counts = parsed.get("max_counts", {})  # Letters with upper bound on count
     
     # Build regex for green letters
     pattern_chars = []
@@ -509,7 +551,7 @@ def filter_candidates(parsed: dict) -> list:
         if not pattern.match(word):
             continue
         
-        # Must not contain grey letters
+        # Must not contain grey letters (letters with 0 count)
         if any(letter in word for letter in grey):
             continue
         
@@ -523,6 +565,20 @@ def filter_candidates(parsed: dict) -> list:
             if pos < len(word) and word[pos] == letter:
                 valid = False
                 break
+        
+        if not valid:
+            continue
+        
+        # Check max_counts: letter must appear EXACTLY that many times (not more)
+        # This handles cases like (r)E(s)et where E is green once and grey once
+        # meaning E appears exactly once in the answer
+        if max_counts:
+            from collections import Counter
+            word_counts = Counter(word)
+            for letter, max_count in max_counts.items():
+                if word_counts[letter] > max_count:
+                    valid = False
+                    break
         
         if valid:
             matches.append(word)
@@ -939,6 +995,7 @@ def sms_reply():
     accumulated_grey = session.get("accumulated_grey", set())
     accumulated_yellow = session.get("accumulated_yellow", {})
     accumulated_green = session.get("accumulated_green", {})
+    accumulated_max_counts = session.get("accumulated_max_counts", {})
     
     # Merge new constraints with accumulated
     # Green overwrites everything for that position
@@ -958,12 +1015,20 @@ def sms_reply():
     # But remove any letters that are now known to be in the word
     accumulated_grey = accumulated_grey - set(accumulated_green.values()) - set(accumulated_yellow.values())
     
+    # Merge max_counts (take the minimum if same letter appears in multiple guesses)
+    for letter, max_count in parsed.get("max_counts", {}).items():
+        if letter in accumulated_max_counts:
+            accumulated_max_counts[letter] = min(accumulated_max_counts[letter], max_count)
+        else:
+            accumulated_max_counts[letter] = max_count
+    
     # Build merged parsed dict for the engine
     merged_parsed = {
         "word": parsed["word"],
         "green": accumulated_green.copy(),
         "yellow": accumulated_yellow.copy(),
         "grey": accumulated_grey.copy(),
+        "max_counts": accumulated_max_counts.copy(),
         "extra_count": parsed["extra_count"]
     }
     
@@ -983,7 +1048,8 @@ def sms_reply():
         "parsed": merged_parsed,
         "accumulated_grey": accumulated_grey,
         "accumulated_yellow": accumulated_yellow,
-        "accumulated_green": accumulated_green
+        "accumulated_green": accumulated_green,
+        "accumulated_max_counts": accumulated_max_counts
     }
     
     # Build response
