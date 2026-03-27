@@ -522,11 +522,18 @@ def parse_input(raw_input: str) -> dict:
 # ============================================
 
 def filter_candidates(parsed: dict) -> list:
-    """Filter words using regex and letter rules."""
-    wordlist = load_wordlist()
-    past = get_past_answers()
-    available = wordlist - past
+    """Filter words using regex and letter rules.
     
+    NOTE: As of Feb 2026, Wordle has started reusing past answers,
+    so we no longer exclude them from suggestions.
+    """
+    wordlist = load_wordlist()
+    # No longer excluding past answers - Wordle reuses words now!
+    return filter_candidates_from_pool(parsed, wordlist)
+
+
+def filter_candidates_from_pool(parsed: dict, word_pool: set) -> list:
+    """Filter words from a specific pool using regex and letter rules."""
     green = parsed["green"]
     yellow = parsed["yellow"]
     grey = parsed["grey"]
@@ -546,7 +553,7 @@ def filter_candidates(parsed: dict) -> list:
     yellow_letters = set(yellow.values())
     
     matches = []
-    for word in available:
+    for word in word_pool:
         # Must match green pattern
         if not pattern.match(word):
             continue
@@ -687,10 +694,9 @@ def get_recent_answers(n: int = 20) -> list:
 def get_best_starter() -> dict:
     """Find best starting words - high freq letters, dissimilar to recent."""
     wordlist = load_wordlist()
-    past = get_past_answers()
-    available = wordlist - past
+    # Use full wordlist now - Wordle reuses answers as of Feb 2026
     
-    if not available:
+    if not wordlist:
         return {"word": "SLATE", "letters": "S, L, A, T, E", "all": ["SLATE"]}
     
     recent = get_recent_answers(20)
@@ -700,13 +706,13 @@ def get_best_starter() -> dict:
             recent_letters[ch] += 1
     
     letter_freq = Counter()
-    for word in available:
+    for word in wordlist:
         for ch in set(word):
             letter_freq[ch] += 1
     
     # Score ALL words with 5 unique letters
     scored = []
-    for word in available:
+    for word in wordlist:
         if len(set(word)) != 5:
             continue
         
@@ -1122,7 +1128,6 @@ def debug2():
     
     wordlist = load_wordlist()
     past = get_past_answers()
-    available = wordlist - past
     
     # Check specific candidate words
     test_candidates = ['FJORD', 'FLOOR', 'FLOUR', 'GLORY', 'IVORY', 'THORN', 'ROOMY', 'CHOIR', 'CHORD']
@@ -1131,15 +1136,16 @@ def debug2():
     for w in test_candidates:
         in_wl = w in wordlist
         in_past = w in past
-        in_avail = w in available
-        results.append(f"{w}: wordlist={in_wl}, past={in_past}, available={in_avail}")
+        results.append(f"{w}: wordlist={in_wl}, past_answer={in_past}")
     
-    # Now run actual filter
+    # Now run actual filter (uses full wordlist now, no longer excludes past)
     parsed = parse_input("a(r)Ose")
     candidates = filter_candidates(parsed)
     
     return (
-        f"Available pool: {len(available)}\n"
+        f"Wordlist size: {len(wordlist)}\n"
+        f"Past answers count: {len(past)}\n"
+        f"NOTE: No longer excluding past answers (Wordle reuses as of Feb 2026)\n"
         f"Parsed: {parsed}\n"
         f"\nTest words:\n" + "\n".join(results) +
         f"\n\nFilter result: {len(candidates)} matches\n"
