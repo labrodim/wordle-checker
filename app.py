@@ -1096,3 +1096,20 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Debug endpoint to check wordlist status."""
+    wordlist = load_wordlist()
+    past = get_past_answers()
+    test_words = ['CHOIR', 'CHORD', 'HERBS', 'SERUM', 'NERDS']
+    in_wordlist = [w for w in test_words if w in wordlist]
+    in_past = [w for w in test_words if w in past]
+    return (
+        f"Wordlist size: {len(wordlist)}\n"
+        f"Past answers: {len(past)}\n"
+        f"Test words in wordlist: {in_wordlist}\n"
+        f"Test words in past: {in_past}\n"
+        f"WORDLIST_PATH: {WORDLIST_PATH}\n"
+    ), 200
