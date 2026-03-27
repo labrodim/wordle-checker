@@ -1113,3 +1113,35 @@ def debug():
         f"Test words in past: {in_past}\n"
         f"WORDLIST_PATH: {WORDLIST_PATH}\n"
     ), 200
+
+
+@app.route("/debug2", methods=["GET"])
+def debug2():
+    """Debug the actual filtering for a(r)Ose pattern."""
+    from flask import request
+    
+    wordlist = load_wordlist()
+    past = get_past_answers()
+    available = wordlist - past
+    
+    # Check specific candidate words
+    test_candidates = ['FJORD', 'FLOOR', 'FLOUR', 'GLORY', 'IVORY', 'THORN', 'ROOMY', 'CHOIR', 'CHORD']
+    
+    results = []
+    for w in test_candidates:
+        in_wl = w in wordlist
+        in_past = w in past
+        in_avail = w in available
+        results.append(f"{w}: wordlist={in_wl}, past={in_past}, available={in_avail}")
+    
+    # Now run actual filter
+    parsed = parse_input("a(r)Ose")
+    candidates = filter_candidates(parsed)
+    
+    return (
+        f"Available pool: {len(available)}\n"
+        f"Parsed: {parsed}\n"
+        f"\nTest words:\n" + "\n".join(results) +
+        f"\n\nFilter result: {len(candidates)} matches\n"
+        f"Candidates: {candidates[:20]}\n"
+    ), 200
